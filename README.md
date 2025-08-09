@@ -3,66 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Emotion Recognition from Audio & Text - Documentation</title>
-  <style>
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      line-height: 1.7;
-      color: #333;
-      max-width: 900px;
-      margin: 40px auto;
-      padding: 20px;
-      background-color: #f9f9fb;
-    }
-    h1, h2, h3 {
-      color: #2c3e50;
-    }
-    h1 {
-      border-bottom: 3px solid #3498db;
-      padding-bottom: 10px;
-    }
-    h2 {
-      margin-top: 30px;
-      color: #2980b9;
-    }
-    code {
-      background-color: #f0f0f0;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: 'Courier New', monospace;
-      font-size: 0.95em;
-    }
-    pre {
-      background-color: #f5f5f5;
-      padding: 15px;
-      border-radius: 6px;
-      overflow-x: auto;
-      border: 1px solid #ddd;
-    }
-    ul, ol {
-      margin: 15px 0;
-    }
-    a {
-      color: #3498db;
-      text-decoration: none;
-    }
-    a:hover {
-      text-decoration: underline;
-    }
-    .footer {
-      margin-top: 50px;
-      text-align: center;
-      font-size: 0.9em;
-      color: #7f8c8d;
-      border-top: 1px solid #eee;
-      padding-top: 20px;
-    }
-    .highlight {
-      background-color: #fffacd;
-      padding: 2px 6px;
-      border-left: 4px solid #ffd700;
-    }
-  </style>
+  
+
 </head>
 <body>
 
