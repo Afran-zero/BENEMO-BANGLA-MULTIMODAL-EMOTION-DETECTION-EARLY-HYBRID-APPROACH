@@ -10,6 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const confidenceSpan = document.getElementById('confidence');
     const confidenceBar = document.getElementById('confidence-bar');
     const modelComparison = document.getElementById('model-comparison');
+    const transcriptionLoader = document.getElementById('transcription-loader'); // ✅ New
     let chart = null;
 
     // Emotion color map
@@ -23,14 +24,40 @@ document.addEventListener('DOMContentLoaded', () => {
         neutral: '#9E9E9E'
     };
 
-    // Audio file handling
-    audioUpload.addEventListener('change', (event) => {
+    // Audio file handling with transcription
+    audioUpload.addEventListener('change', async (event) => {
         const file = event.target.files[0];
         if (file) {
+            // Set audio player source
             const audioURL = URL.createObjectURL(file);
             audioPlayer.src = audioURL;
             audioPlayerContainer.style.display = 'block';
             audioPlayer.load();
+
+            // ✅ Show loader, clear previous text
+            textInput.value = '';
+            transcriptionLoader.style.display = 'flex';
+
+            // Transcribe audio automatically
+            const formData = new FormData();
+            formData.append('audio', file);
+            try {
+                const response = await fetch('/transcribe', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!response.ok) {
+                    throw new Error('Transcription failed');
+                }
+                const data = await response.json();
+                textInput.value = data.text || ''; // Fill transcribed text
+            } catch (error) {
+                console.error('Transcription error:', error);
+                textInput.value = 'Transcription failed. Please enter manually.'; // Optional fallback
+            } finally {
+                // ✅ Hide loader after success or failure
+                transcriptionLoader.style.display = 'none';
+            }
         }
     });
 
@@ -46,14 +73,14 @@ document.addEventListener('DOMContentLoaded', () => {
         uploadArea.classList.remove('dragover');
     });
 
-    uploadArea.addEventListener('drop', (e) => {
+    uploadArea.addEventListener('drop', async (e) => {
         e.preventDefault();
         uploadArea.classList.remove('dragover');
         
         if (e.dataTransfer.files.length && e.dataTransfer.files[0].type.includes('audio')) {
             audioUpload.files = e.dataTransfer.files;
             const event = new Event('change');
-            audioUpload.dispatchEvent(event);
+            audioUpload.dispatchEvent(event); // Triggers transcription + player
         } else {
             alert('Please upload an audio file (WAV format)');
         }

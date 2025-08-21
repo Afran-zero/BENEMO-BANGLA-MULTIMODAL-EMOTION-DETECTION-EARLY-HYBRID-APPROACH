@@ -2,20 +2,31 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import librosa
+import torchaudio
 import re
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse
+import time
+import tempfile
+from tempfile import NamedTemporaryFile
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from starlette.requests import Request
 from transformers import Wav2Vec2Processor, Wav2Vec2Model, AutoTokenizer, AutoModel
+from banglaspeech2text import Speech2Text
 import io
 import base64
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
+import logging
+
+# Set audio backend to avoid SoX warnings
+torchaudio.set_audio_backend("soundfile")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -23,38 +34,83 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 # Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
+logger.info(f"Using device: {device}")
 
 # Load emotion map
 LOCAL_OUTPUT_DIR = "models"
-emotion_map = np.load(os.path.join(LOCAL_OUTPUT_DIR, "emotion_map_no_pca.npy"), allow_pickle=True).item()
-emotion_classes = list(emotion_map.keys())
-num_classes = len(emotion_classes)
+try:
+    emotion_map = np.load(os.path.join(LOCAL_OUTPUT_DIR, "emotion_map_no_pca.npy"), allow_pickle=True).item()
+    emotion_classes = list(emotion_map.keys())
+    num_classes = len(emotion_classes)
+    logger.info(f"Loaded emotion map: {emotion_map}")
+    logger.info(f"Emotion classes: {emotion_classes}")
+except FileNotFoundError:
+    logger.error("Emotion map file not found")
+    raise HTTPException(status_code=500, detail="Emotion map file not found")
 
 # Load feature extractors
-wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
-wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base").to(device).eval()
-bert_tokenizer = AutoTokenizer.from_pretrained("sagorsarker/bangla-bert-base")
-bert_model = AutoModel.from_pretrained("sagorsarker/bangla-bert-base").to(device).eval()
+try:
+    wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
+    wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base").to(device).eval()
+    bert_tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/banglabert", clean_up_tokenization_spaces=True)
+    bert_model = AutoModel.from_pretrained("csebuetnlp/banglabert").to(device).eval()
+    logger.info("Feature extractors loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading feature extractors: {e}")
+    raise HTTPException(status_code=500, detail="Failed to load feature extractors")
+
+# Load Bangla STT model
+try:
+    stt = Speech2Text("large")
+    logger.info("Bangla STT model loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading STT model: {e}")
+    raise HTTPException(status_code=500, detail="Failed to load STT model")
 
 # Audio preprocessing
-def preprocess_audio(audio_data, target_sr=16000, duration=7):
+def preprocess_audio_for_model(audio_data, target_sr=16000):
+    """
+    Audio preprocessing matching Colab training pipeline.
+    Steps:
+    - Load audio from bytes
+    - Resample to 16kHz if needed
+    - Convert to mono
+    - Return 1D tensor
+    """
     try:
-        audio, sr = librosa.load(io.BytesIO(audio_data), sr=None)
+        if not audio_data or len(audio_data) < 100:  # Check for empty or very small audio
+            logger.warning("Audio data is empty or too small")
+            return None
+
+        # Save to temp file for loading
+        with NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+
+        # Load audio using torchaudio to match Colab
+        waveform, sr = torchaudio.load(temp_file_path)
+        os.unlink(temp_file_path)  # Clean up
+
+        # Check if waveform is valid
+        if waveform.numel() == 0 or waveform.shape[-1] < target_sr // 10:  # Less than 0.1s
+            logger.warning("Audio waveform is empty or too short")
+            return None
+
+        # Convert to mono if stereo
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # Resample to 16kHz if needed
         if sr != target_sr:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-        audio, _ = librosa.effects.trim(audio, top_db=20)
-        target_length = target_sr * duration
-        if len(audio) > target_length:
-            audio = audio[:target_length]
-        else:
-            audio = np.pad(audio, (0, target_length - len(audio)), mode='constant')
-        if np.max(np.abs(audio)) > 0:
-            audio = audio / np.max(np.abs(audio))
-        return audio
+            waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=target_sr)
+
+        logger.info(f"Processed audio: duration {waveform.shape[-1]/target_sr:.2f}s, shape {waveform.shape}")
+        return waveform.squeeze()  # Return as 1D tensor
     except Exception as e:
-        print(f"Error processing audio: {e}")
+        logger.error(f"Error processing audio: {e}")
         return None
 
 # Text preprocessing
@@ -68,30 +124,36 @@ def preprocess_text(text):
 # Feature extraction
 def extract_audio_features(audio, processor, model):
     try:
-        audio_tensor = torch.tensor(audio, dtype=torch.float32).to(device)
-        inputs = processor(audio_tensor, sampling_rate=16000, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        if isinstance(audio, np.ndarray):
+            audio = torch.tensor(audio, dtype=torch.float32)
+        audio = audio.to(device)
+        inputs = processor(audio, sampling_rate=16000, return_tensors="pt", padding=True)
         with torch.no_grad():
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             outputs = model(**inputs)
             features = outputs.last_hidden_state.mean(dim=1)
-        return features.squeeze().cpu().numpy()
+        features = features.squeeze().cpu().numpy()
+        logger.info(f"Audio features shape: {features.shape}, mean: {np.mean(features):.4f}, std: {np.std(features):.4f}")
+        return features
     except Exception as e:
-        print(f"Error extracting audio features: {e}")
+        logger.error(f"Error extracting audio features: {e}")
         return None
 
 def extract_text_features(text, tokenizer, model):
     try:
         if not text or text.strip() == '':
-            print("Empty text provided, using zero features")
+            logger.info("Empty text provided, using zero features")
             return np.zeros(768)
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
         with torch.no_grad():
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             outputs = model(**inputs)
             features = outputs.last_hidden_state.mean(dim=1)
-        return features.squeeze().cpu().numpy()
+        features = features.squeeze().cpu().numpy()
+        logger.info(f"Text features shape: {features.shape}, mean: {np.mean(features):.4f}, std: {np.std(features):.4f}")
+        return features
     except Exception as e:
-        print(f"Error extracting text features: {e}")
+        logger.error(f"Error extracting text features: {e}")
         return None
 
 # MLP model definition
@@ -122,7 +184,7 @@ class BiGRU(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True,
-                         bidirectional=True, dropout=dropout if num_layers > 1 else 0)
+                          bidirectional=True, dropout=dropout if num_layers > 1 else 0)
         self.fc = nn.Linear(hidden_dim * 2, output_dim)
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(hidden_dim * 2)
@@ -138,19 +200,27 @@ class BiGRU(nn.Module):
 
 # Load models
 def load_mlp_model():
-    model_path = 'models/mlp_no_pca.pth'
+    model_path = os.path.join(LOCAL_OUTPUT_DIR, 'mlp_no_pca.pth')
+    if not os.path.exists(model_path):
+        logger.error(f"MLP model file not found: {model_path}")
+        raise FileNotFoundError(f"MLP model file not found: {model_path}")
     mlp_model = MLP(input_dim=1536, hidden_dim=1024, output_dim=num_classes, num_layers=3, dropout=0.5).to(device)
-    state_dict = torch.load(model_path, map_location=device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
     mlp_model.load_state_dict(state_dict)
     mlp_model.eval()
+    logger.info("MLP model loaded successfully")
     return mlp_model
 
 def load_bigru_model():
-    model_path = 'models/bigru_no_pca.pth'
+    model_path = os.path.join(LOCAL_OUTPUT_DIR, 'bigru_no_pca.pth')
+    if not os.path.exists(model_path):
+        logger.error(f"BiGRU model file not found: {model_path}")
+        raise FileNotFoundError(f"BiGRU model file not found: {model_path}")
     bigru_model = BiGRU(input_dim=1536, hidden_dim=512, output_dim=num_classes, num_layers=3, dropout=0.5).to(device)
-    state_dict = torch.load(model_path, map_location=device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
     bigru_model.load_state_dict(state_dict)
     bigru_model.eval()
+    logger.info("BiGRU model loaded successfully")
     return bigru_model
 
 # Ensemble predictor
@@ -168,11 +238,13 @@ class EnsemblePredictor:
                 self.mlp_model, feature, emotion_map, device, "MLP")
             predictions['MLP'] = {'emotion': mlp_emotion, 'confidence': float(mlp_conf), 'probs': mlp_probs.tolist()}
             probabilities['MLP'] = mlp_probs
+            logger.info(f"MLP prediction: {mlp_emotion}, confidence: {mlp_conf:.3f}, probs: {dict(zip(emotion_classes, mlp_probs.tolist()))}")
         if self.bigru_model:
             bigru_emotion, bigru_probs, bigru_conf = self._predict_single_model(
                 self.bigru_model, feature, emotion_map, device, "BiGRU")
             predictions['BiGRU'] = {'emotion': bigru_emotion, 'confidence': float(bigru_conf), 'probs': bigru_probs.tolist()}
             probabilities['BiGRU'] = bigru_probs
+            logger.info(f"BiGRU prediction: {bigru_emotion}, confidence: {bigru_conf:.3f}, probs: {dict(zip(emotion_classes, bigru_probs.tolist()))}")
         if len(probabilities) > 1:
             ensemble_probs = self._ensemble_probabilities(probabilities)
             ensemble_class = np.argmax(ensemble_probs)
@@ -184,6 +256,7 @@ class EnsemblePredictor:
                 'confidence': float(ensemble_conf),
                 'probs': ensemble_probs.tolist()
             }
+            logger.info(f"Ensemble prediction: {ensemble_emotion}, confidence: {ensemble_conf:.3f}, probs: {dict(zip(emotion_classes, ensemble_probs.tolist()))}")
         return predictions
 
     def _predict_single_model(self, model, feature, emotion_map, device, model_name):
@@ -202,7 +275,7 @@ class EnsemblePredictor:
                 confidence = probabilities[predicted_class]
                 return emotion, probabilities, confidence
         except Exception as e:
-            print(f"Error in {model_name} prediction: {e}")
+            logger.error(f"Error in {model_name} prediction: {e}")
             return None, None, None
 
     def _ensemble_probabilities(self, probabilities):
@@ -213,36 +286,66 @@ class EnsemblePredictor:
             weighted_probs += weight * probabilities[model_name]
         return weighted_probs
 
-# Load models
-mlp_model = load_mlp_model()
-bigru_model = load_bigru_model()
-ensemble_predictor = EnsemblePredictor(mlp_model, bigru_model, ensemble_weights=[0.6, 0.4])
+# Process input
+def process_input(audio_data, text_input, ensemble_predictor):
+    start_time = time.time()
+    audio = preprocess_audio_for_model(audio_data)
+    if audio is None:
+        logger.error("Failed to process audio")
+        return None, None
+    text = preprocess_text(text_input)
+    logger.info(f"Cleaned text: '{text}'")
+    audio_features = extract_audio_features(audio, wav2vec_processor, wav2vec_model)
+    if audio_features is None:
+        logger.error("Failed to extract audio features")
+        return None, None
+    text_features = extract_text_features(text, bert_tokenizer, bert_model)
+    if text_features is None:
+        logger.error("Failed to extract text features")
+        return None, None
+    combined_features = np.concatenate([audio_features, text_features])
+    results = ensemble_predictor.predict(combined_features, emotion_map, device)
+    inference_time = time.time() - start_time
+    return results, inference_time
 
 # Generate plot
 def generate_plot(results, emotion_classes):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    colors = plt.cm.Set3(np.linspace(0, 1, len(emotion_classes)))
-    result = results['Ensemble']
-    bars = ax.bar(emotion_classes, result['probs'], color=colors)
-    for bar, prob in zip(bars, result['probs']):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                f'{prob:.3f}', ha='center', va='bottom', fontweight='bold')
-    ax.set_title(f'Ensemble Prediction: {result["emotion"]} ({result["confidence"]:.3f})',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Emotion', fontweight='bold')
-    ax.set_ylabel('Probability', fontweight='bold')
-    ax.set_xticks(range(len(emotion_classes)))  # Set tick positions
-    ax.set_xticklabels(emotion_classes, rotation=45)  # Set tick labels
-    ax.set_ylim(0, 1.0)
-    ax.grid(axis='y', alpha=0.3)
-    plt.tight_layout()
-    buffer = io.BytesIO()
-    plt.savefig(buffer, format='png')
-    plt.close()
-    buffer.seek(0)
-    image_png = buffer.getvalue()
-    return base64.b64encode(image_png).decode('utf-8')
+    try:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        colors = plt.cm.Set3(np.linspace(0, 1, len(emotion_classes)))
+        result = results['Ensemble']
+        bars = ax.bar(emotion_classes, result['probs'], color=colors)
+        for bar, prob in zip(bars, result['probs']):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{prob:.3f}', ha='center', va='bottom', fontweight='bold')
+        ax.set_title(f'Ensemble Prediction: {result["emotion"]} ({result["confidence"]:.3f})',
+                     fontsize=12, fontweight='bold')
+        ax.set_xlabel('Emotion', fontweight='bold')
+        ax.set_ylabel('Probability', fontweight='bold')
+        ax.set_xticks(range(len(emotion_classes)))
+        ax.set_xticklabels(emotion_classes, rotation=45)
+        ax.set_ylim(0, 1.0)
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='png')
+        plt.close()
+        buffer.seek(0)
+        image_png = buffer.getvalue()
+        return base64.b64encode(image_png).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error generating plot: {e}")
+        return None
+
+# Load models
+try:
+    mlp_model = load_mlp_model()
+    bigru_model = load_bigru_model()
+    ensemble_predictor = EnsemblePredictor(mlp_model, bigru_model, ensemble_weights=[0.6, 0.4])
+except Exception as e:
+    logger.error(f"Error loading models: {e}")
+    raise HTTPException(status_code=500, detail="Failed to load models")
 
 # Routes
 @app.get("/", response_class=HTMLResponse)
@@ -257,31 +360,98 @@ async def about(request: Request):
 async def predict_page(request: Request):
     return templates.TemplateResponse("predict.html", {"request": request})
 
+@app.get("/favicon.ico", response_class=FileResponse)
+async def favicon():
+    favicon_path = os.path.join("static", "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path)
+    logger.warning("Favicon not found")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
 @app.post("/predict")
 async def predict(audio: UploadFile = File(...), text: str = Form(...)):
     try:
         audio_data = await audio.read()
+        if len(audio_data) > 10 * 1024 * 1024:  # Limit to 10MB
+            raise HTTPException(status_code=400, detail="Audio file too large (max 10MB)")
+
+        # Transcribe audio if no text provided
         text_input = preprocess_text(text)
-        audio_processed = preprocess_audio(audio_data)
-        if audio_processed is None:
-            raise HTTPException(status_code=400, detail="Failed to process audio")
-        audio_features = extract_audio_features(audio_processed, wav2vec_processor, wav2vec_model)
-        if audio_features is None:
-            raise HTTPException(status_code=400, detail="Failed to extract audio features")
-        text_features = extract_text_features(text_input, bert_tokenizer, bert_model)
-        if text_features is None:
-            raise HTTPException(status_code=400, detail="Failed to extract text features")
-        combined_features = np.concatenate([audio_features, text_features])
-        results = ensemble_predictor.predict(combined_features, emotion_map, device)
-        if not results:
-            raise HTTPException(status_code=500, detail="Prediction failed")
+        if not text_input:
+            logger.info("No text input, transcribing...")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_file_path = temp_file.name
+            waveform, sr = torchaudio.load(temp_file_path)
+            os.unlink(temp_file_path)
+
+            if sr != 48000:
+                waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=48000)
+            if waveform.abs().max() > 0:
+                waveform = waveform / waveform.abs().max()
+
+            buf = io.BytesIO()
+            torchaudio.save(buf, waveform, 48000, format='wav')
+            buf.seek(0)
+            text_input = preprocess_text(stt.recognize(buf))
+
+        logger.info(f"Raw text input: '{text}'")
+        logger.info(f"Final text input: '{text_input}'")
+
+        # Process input
+        results, inference_time = process_input(audio_data, text_input, ensemble_predictor)
+        if results is None:
+            raise HTTPException(status_code=400, detail="Failed to process input")
+
+        # Generate plot
         plot_base64 = generate_plot(results, emotion_classes)
+        if plot_base64 is None:
+            raise HTTPException(status_code=500, detail="Failed to generate plot")
+
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
         return {
             "results": results,
             "plot": plot_base64,
             "audio": audio_base64,
-            "emotion_classes": emotion_classes
+            "emotion_classes": emotion_classes,
+            "transcribed_text": text_input,
+            "inference_time": inference_time,
+            "warning": None
         }
     except Exception as e:
+        logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    try:
+        audio_data = await audio.read()
+        if len(audio_data) > 10 * 1024 * 1024:  # Limit to 10MB
+            raise HTTPException(status_code=400, detail="Audio file too large (max 10MB)")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+        waveform, sr = torchaudio.load(temp_file_path)
+        os.unlink(temp_file_path)
+
+        if sr != 48000:
+            waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=48000)
+        if waveform.abs().max() > 0:
+            waveform = waveform / waveform.abs().max()
+
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, waveform, 48000, format='wav')
+        buffer.seek(0)
+
+        transcription = stt.recognize(buffer)
+        logger.info(f"Transcription: '{transcription}'")
+        return {"text": transcription}
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to transcribe audio")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

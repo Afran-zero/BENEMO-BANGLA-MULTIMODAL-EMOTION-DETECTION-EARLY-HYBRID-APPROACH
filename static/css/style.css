@@ -484,3 +484,31 @@ audio::-webkit-media-controls-mute-button {
     opacity: 0.8;
     margin: 0.3rem 0;
 }
+.loader-container {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 0.85em;
+    color: #007bff;
+    animation: fadeIn 0.3s ease;
+}
+
+.spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid #f3f3f3;
+    border-top: 2px solid #007bff;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
