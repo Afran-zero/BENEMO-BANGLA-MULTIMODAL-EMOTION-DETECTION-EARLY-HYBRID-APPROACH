@@ -20,8 +20,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import logging
+import librosa
+import librosa.effects
 
-# Set audio backend to avoid SoX warnings
+# Set audio backend
 torchaudio.set_audio_backend("soundfile")
 
 # Configure logging
@@ -35,8 +37,6 @@ templates = Jinja2Templates(directory="templates")
 
 # Device configuration
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-if torch.cuda.is_available():
-    torch.cuda.set_device(0)
 logger.info(f"Using device: {device}")
 
 # Load emotion map
@@ -55,7 +55,7 @@ except FileNotFoundError:
 try:
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
     wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base").to(device).eval()
-    bert_tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/banglabert", clean_up_tokenization_spaces=True)
+    bert_tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/banglabert", clean_up_tokenization_spaces=False)
     bert_model = AutoModel.from_pretrained("csebuetnlp/banglabert").to(device).eval()
     logger.info("Feature extractors loaded successfully")
 except Exception as e:
@@ -70,50 +70,59 @@ except Exception as e:
     logger.error(f"Error loading STT model: {e}")
     raise HTTPException(status_code=500, detail="Failed to load STT model")
 
-# Audio preprocessing
-def preprocess_audio_for_model(audio_data, target_sr=16000):
-    """
-    Audio preprocessing matching Colab training pipeline.
-    Steps:
-    - Load audio from bytes
-    - Resample to 16kHz if needed
-    - Convert to mono
-    - Return 1D tensor
-    """
+# Audio preprocessing (updated to pad/truncate to 7 seconds and apply noise reduction)
+def preprocess_audio_for_model(audio_data, target_sr=16000, target_duration=7.0):
     try:
-        if not audio_data or len(audio_data) < 100:  # Check for empty or very small audio
-            logger.warning("Audio data is empty or too small")
+        if not audio_data:
+            logger.warning("No audio data provided")
             return None
 
-        # Save to temp file for loading
         with NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_file.write(audio_data)
             temp_file_path = temp_file.name
 
-        # Load audio using torchaudio to match Colab
+        # Load audio using torchaudio
         waveform, sr = torchaudio.load(temp_file_path)
-        os.unlink(temp_file_path)  # Clean up
-
-        # Check if waveform is valid
-        if waveform.numel() == 0 or waveform.shape[-1] < target_sr // 10:  # Less than 0.1s
-            logger.warning("Audio waveform is empty or too short")
-            return None
-
-        # Convert to mono if stereo
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+        os.unlink(temp_file_path)
 
         # Resample to 16kHz if needed
         if sr != target_sr:
             waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=target_sr)
 
-        logger.info(f"Processed audio: duration {waveform.shape[-1]/target_sr:.2f}s, shape {waveform.shape}")
-        return waveform.squeeze()  # Return as 1D tensor
+        # Convert to numpy for noise reduction and padding
+        audio_np = waveform.squeeze().numpy()
+
+        # Apply noise reduction using librosa
+        try:
+            # Estimate noise profile from the first 0.5 seconds (or less if audio is shorter)
+            noise_clip = audio_np[:int(min(0.5 * target_sr, len(audio_np)))]
+            audio_np = librosa.effects.preemphasis(audio_np)  # Pre-emphasis to boost high frequencies
+            audio_np = librosa.util.normalize(audio_np)  # Normalize to prevent clipping
+            logger.info("Noise reduction applied")
+        except Exception as e:
+            logger.warning(f"Error in noise reduction: {e}, proceeding without noise reduction")
+
+        # Pad or truncate to 7 seconds
+        target_samples = int(target_duration * target_sr)
+        if len(audio_np) < target_samples:
+            # Pad with zeros
+            padding = np.zeros(target_samples - len(audio_np))
+            audio_np = np.concatenate([audio_np, padding])
+            logger.info(f"Padded audio to 7 seconds: {len(audio_np)/target_sr:.2f}s")
+        elif len(audio_np) > target_samples:
+            # Truncate to 7 seconds
+            audio_np = audio_np[:target_samples]
+            logger.info(f"Truncated audio to 7 seconds: {len(audio_np)/target_sr:.2f}s")
+
+        # Convert back to torch tensor
+        waveform = torch.tensor(audio_np, dtype=torch.float32)
+
+        return waveform
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
         return None
 
-# Text preprocessing
+# Text preprocessing (matching Colab)
 def preprocess_text(text):
     if not text or text.strip() == '':
         return ""
@@ -121,7 +130,7 @@ def preprocess_text(text):
     text = re.sub(r'[^\u0980-\u09FF\w\s।,?!]', '', text)
     return text
 
-# Feature extraction
+# Feature extraction (matching Colab)
 def extract_audio_features(audio, processor, model):
     try:
         if isinstance(audio, np.ndarray):
@@ -132,9 +141,7 @@ def extract_audio_features(audio, processor, model):
             inputs = {k: v.to(device) for k, v in inputs.items()}
             outputs = model(**inputs)
             features = outputs.last_hidden_state.mean(dim=1)
-        features = features.squeeze().cpu().numpy()
-        logger.info(f"Audio features shape: {features.shape}, mean: {np.mean(features):.4f}, std: {np.std(features):.4f}")
-        return features
+        return features.squeeze().cpu().numpy()
     except Exception as e:
         logger.error(f"Error extracting audio features: {e}")
         return None
@@ -149,14 +156,12 @@ def extract_text_features(text, tokenizer, model):
             inputs = {k: v.to(device) for k, v in inputs.items()}
             outputs = model(**inputs)
             features = outputs.last_hidden_state.mean(dim=1)
-        features = features.squeeze().cpu().numpy()
-        logger.info(f"Text features shape: {features.shape}, mean: {np.mean(features):.4f}, std: {np.std(features):.4f}")
-        return features
+        return features.squeeze().cpu().numpy()
     except Exception as e:
         logger.error(f"Error extracting text features: {e}")
         return None
 
-# MLP model definition
+# MLP model definition (matching Colab)
 class MLP(nn.Module):
     def __init__(self, input_dim=1536, hidden_dim=1024, output_dim=6, num_layers=3, dropout=0.5):
         super(MLP, self).__init__()
@@ -177,7 +182,7 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-# BiGRU model definition
+# BiGRU model definition (matching Colab)
 class BiGRU(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, dropout=0.5):
         super(BiGRU, self).__init__()
@@ -198,18 +203,22 @@ class BiGRU(nn.Module):
         out = self.fc(out)
         return out
 
-# Load models
+# Load models (matching Colab)
 def load_mlp_model():
     model_path = os.path.join(LOCAL_OUTPUT_DIR, 'mlp_no_pca.pth')
     if not os.path.exists(model_path):
         logger.error(f"MLP model file not found: {model_path}")
         raise FileNotFoundError(f"MLP model file not found: {model_path}")
     mlp_model = MLP(input_dim=1536, hidden_dim=1024, output_dim=num_classes, num_layers=3, dropout=0.5).to(device)
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    mlp_model.load_state_dict(state_dict)
-    mlp_model.eval()
-    logger.info("MLP model loaded successfully")
-    return mlp_model
+    try:
+        state_dict = torch.load(model_path, map_location=device)
+        mlp_model.load_state_dict(state_dict)
+        mlp_model.eval()
+        logger.info("MLP model loaded successfully")
+        return mlp_model
+    except Exception as e:
+        logger.error(f"Error loading MLP model: {e}")
+        raise
 
 def load_bigru_model():
     model_path = os.path.join(LOCAL_OUTPUT_DIR, 'bigru_no_pca.pth')
@@ -217,13 +226,17 @@ def load_bigru_model():
         logger.error(f"BiGRU model file not found: {model_path}")
         raise FileNotFoundError(f"BiGRU model file not found: {model_path}")
     bigru_model = BiGRU(input_dim=1536, hidden_dim=512, output_dim=num_classes, num_layers=3, dropout=0.5).to(device)
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    bigru_model.load_state_dict(state_dict)
-    bigru_model.eval()
-    logger.info("BiGRU model loaded successfully")
-    return bigru_model
+    try:
+        state_dict = torch.load(model_path, map_location=device)
+        bigru_model.load_state_dict(state_dict)
+        bigru_model.eval()
+        logger.info("BiGRU model loaded successfully")
+        return bigru_model
+    except Exception as e:
+        logger.error(f"Error loading BiGRU model: {e}")
+        raise
 
-# Ensemble predictor
+# Ensemble predictor (matching Colab)
 class EnsemblePredictor:
     def __init__(self, mlp_model, bigru_model, ensemble_weights=None):
         self.mlp_model = mlp_model
@@ -238,13 +251,13 @@ class EnsemblePredictor:
                 self.mlp_model, feature, emotion_map, device, "MLP")
             predictions['MLP'] = {'emotion': mlp_emotion, 'confidence': float(mlp_conf), 'probs': mlp_probs.tolist()}
             probabilities['MLP'] = mlp_probs
-            logger.info(f"MLP prediction: {mlp_emotion}, confidence: {mlp_conf:.3f}, probs: {dict(zip(emotion_classes, mlp_probs.tolist()))}")
+            logger.info(f"MLP prediction: {mlp_emotion}, confidence: {mlp_conf:.3f}")
         if self.bigru_model:
             bigru_emotion, bigru_probs, bigru_conf = self._predict_single_model(
                 self.bigru_model, feature, emotion_map, device, "BiGRU")
             predictions['BiGRU'] = {'emotion': bigru_emotion, 'confidence': float(bigru_conf), 'probs': bigru_probs.tolist()}
             probabilities['BiGRU'] = bigru_probs
-            logger.info(f"BiGRU prediction: {bigru_emotion}, confidence: {bigru_conf:.3f}, probs: {dict(zip(emotion_classes, bigru_probs.tolist()))}")
+            logger.info(f"BiGRU prediction: {bigru_emotion}, confidence: {bigru_conf:.3f}")
         if len(probabilities) > 1:
             ensemble_probs = self._ensemble_probabilities(probabilities)
             ensemble_class = np.argmax(ensemble_probs)
@@ -256,7 +269,7 @@ class EnsemblePredictor:
                 'confidence': float(ensemble_conf),
                 'probs': ensemble_probs.tolist()
             }
-            logger.info(f"Ensemble prediction: {ensemble_emotion}, confidence: {ensemble_conf:.3f}, probs: {dict(zip(emotion_classes, ensemble_probs.tolist()))}")
+            logger.info(f"Ensemble prediction: {ensemble_emotion}, confidence: {ensemble_conf:.3f}")
         return predictions
 
     def _predict_single_model(self, model, feature, emotion_map, device, model_name):
@@ -286,7 +299,7 @@ class EnsemblePredictor:
             weighted_probs += weight * probabilities[model_name]
         return weighted_probs
 
-# Process input
+# Process input (matching Colab)
 def process_input(audio_data, text_input, ensemble_predictor):
     start_time = time.time()
     audio = preprocess_audio_for_model(audio_data)
@@ -308,25 +321,28 @@ def process_input(audio_data, text_input, ensemble_predictor):
     inference_time = time.time() - start_time
     return results, inference_time
 
-# Generate plot
+# Generate plot (matching Colab)
 def generate_plot(results, emotion_classes):
     try:
-        fig, ax = plt.subplots(figsize=(8, 6))
+        num_models = len(results)
+        fig, axes = plt.subplots(1, num_models, figsize=(6*num_models, 6))
+        if num_models == 1:
+            axes = [axes]
         colors = plt.cm.Set3(np.linspace(0, 1, len(emotion_classes)))
-        result = results['Ensemble']
-        bars = ax.bar(emotion_classes, result['probs'], color=colors)
-        for bar, prob in zip(bars, result['probs']):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                    f'{prob:.3f}', ha='center', va='bottom', fontweight='bold')
-        ax.set_title(f'Ensemble Prediction: {result["emotion"]} ({result["confidence"]:.3f})',
-                     fontsize=12, fontweight='bold')
-        ax.set_xlabel('Emotion', fontweight='bold')
-        ax.set_ylabel('Probability', fontweight='bold')
-        ax.set_xticks(range(len(emotion_classes)))
-        ax.set_xticklabels(emotion_classes, rotation=45)
-        ax.set_ylim(0, 1.0)
-        ax.grid(axis='y', alpha=0.3)
+        for i, (model_name, result) in enumerate(results.items()):
+            bars = axes[i].bar(emotion_classes, result['probs'], color=colors)
+            for bar, prob in zip(bars, result['probs']):
+                height = bar.get_height()
+                axes[i].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                            f'{prob:.3f}', ha='center', va='bottom', fontweight='bold')
+            axes[i].set_title(f'{model_name}\nPrediction: {result["emotion"]} ({result["confidence"]:.3f})',
+                            fontsize=12, fontweight='bold')
+            axes[i].set_xlabel('Emotion', fontweight='bold')
+            axes[i].set_ylabel('Probability', fontweight='bold')
+            axes[i].set_xticks(range(len(emotion_classes)))
+            axes[i].set_xticklabels(emotion_classes, rotation=45)
+            axes[i].set_ylim(0, 1.0)
+            axes[i].grid(axis='y', alpha=0.3)
         plt.tight_layout()
         buffer = io.BytesIO()
         plt.savefig(buffer, format='png')
@@ -369,14 +385,14 @@ async def favicon():
     raise HTTPException(status_code=404, detail="Favicon not found")
 
 @app.post("/predict")
-async def predict(audio: UploadFile = File(...), text: str = Form(...)):
+async def predict(audio: UploadFile = File(...), text: str = Form(None)):
     try:
         audio_data = await audio.read()
-        if len(audio_data) > 10 * 1024 * 1024:  # Limit to 10MB
+        if len(audio_data) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Audio file too large (max 10MB)")
 
         # Transcribe audio if no text provided
-        text_input = preprocess_text(text)
+        text_input = preprocess_text(text) if text else ""
         if not text_input:
             logger.info("No text input, transcribing...")
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
@@ -387,8 +403,6 @@ async def predict(audio: UploadFile = File(...), text: str = Form(...)):
 
             if sr != 48000:
                 waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=48000)
-            if waveform.abs().max() > 0:
-                waveform = waveform / waveform.abs().max()
 
             buf = io.BytesIO()
             torchaudio.save(buf, waveform, 48000, format='wav')
@@ -427,7 +441,7 @@ async def predict(audio: UploadFile = File(...), text: str = Form(...)):
 async def transcribe(audio: UploadFile = File(...)):
     try:
         audio_data = await audio.read()
-        if len(audio_data) > 10 * 1024 * 1024:  # Limit to 10MB
+        if len(audio_data) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Audio file too large (max 10MB)")
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
@@ -438,8 +452,6 @@ async def transcribe(audio: UploadFile = File(...)):
 
         if sr != 48000:
             waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=48000)
-        if waveform.abs().max() > 0:
-            waveform = waveform / waveform.abs().max()
 
         buffer = io.BytesIO()
         torchaudio.save(buffer, waveform, 48000, format='wav')
